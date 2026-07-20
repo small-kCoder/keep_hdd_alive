@@ -1,0 +1,12 @@
+{
+    "target_drive": "G:",
+    "keep_alive_dir": null,
+    "keep_alive_interval_seconds": 120,
+    "check_interval_seconds": 1800,
+    "keep_alive_file_size_kb": 4,
+    "physical_disk": null,
+    "log_file": null,
+    "log_level": "INFO",
+    "max_log_file_size_mb": 10,
+    "log_backup_count": 3
+}

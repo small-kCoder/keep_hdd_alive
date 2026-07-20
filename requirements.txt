@@ -1,0 +1,8 @@
+# 智能机械硬盘防休眠脚本依赖
+# 安装命令: pip install -r requirements.txt
+#
+# 命令行版本仅需 psutil
+# GUI 版本还需要 PyQt6
+
+psutil>=5.9.0
+PyQt6>=6.5
