@@ -33,6 +33,7 @@ from keep_hdd_alive import (
     DEFAULT_CONFIG,
     get_physical_disk_for_drive,
     validate_drive_access,
+    get_all_physical_disks,
 )
 
 # ---------------------------------------------------------------------------
@@ -43,9 +44,9 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton,
     QSpinBox, QStatusBar, QGridLayout, QSizePolicy, QMessageBox,
     QFileDialog, QFrame, QSystemTrayIcon, QMenu, QDialog,
-    QDialogButtonBox,
+    QDialogButtonBox, QCheckBox, QSlider,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex, QPropertyAnimation, QEasingCurve, QSequentialAnimationGroup
 from PyQt6.QtGui import QFont, QColor, QIcon, QPalette, QAction
 
 
@@ -397,23 +398,16 @@ class KeepAliveWorker(QThread):
 
 
 # ============================================================
-# 可获取系统盘符列表的下拉框
+# 磁盘加载线程
 # ============================================================
 
-def get_available_drives() -> list:
-    """获取当前系统可用的盘符列表。"""
-    try:
-        import psutil
-        drives = []
-        for p in psutil.disk_partitions():
-            if p.mountpoint and len(p.mountpoint) >= 2:
-                drive = p.mountpoint[:2]  # e.g., "C:"
-                if drive not in drives:
-                    drives.append(drive)
-        return sorted(drives)
-    except Exception:
-        # 降级：返回常见盘符
-        return [f"{chr(c)}:" for c in range(ord("C"), ord("Z") + 1)]
+class DiskLoadWorker(QThread):
+    """后台线程：调用 PowerShell 获取物理磁盘列表，避免阻塞 GUI 启动。"""
+    disks_loaded = pyqtSignal(list)  # 发送磁盘列表
+
+    def run(self):
+        disks = get_all_physical_disks()
+        self.disks_loaded.emit(disks)
 
 
 # ============================================================
@@ -436,11 +430,13 @@ class MainWindow(QMainWindow):
         self.is_monitoring: bool = False
         self.current_mode: str = "stopped"  # active / idle / stopped
         self.current_unit: str = "分钟"       # 当前时间单位
+        self.all_disks: list = []             # 延迟加载
+        self.external_disks: list = []        # 延迟加载
+        self.disk_load_worker: Optional[DiskLoadWorker] = None
 
-        # 构建 UI
+        # 构建 UI（不加载磁盘列表，先显示窗口）
         self._init_ui()
         self._init_tray()
-        self._init_defaults()
         self._update_control_states()
 
         # 状态栏初始显示
@@ -492,13 +488,41 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.cmb_unit, row, 1)
         row += 1
 
-        # 目标硬盘
+        # 目标硬盘（物理磁盘）
         grid.addWidget(QLabel("目标硬盘:"), row, 0)
-        self.cmb_drive = QComboBox()
-        self.cmb_drive.addItems(get_available_drives())
-        self.cmb_drive.setMinimumWidth(80)
-        grid.addWidget(self.cmb_drive, row, 1)
-        grid.addWidget(QLabel(""), row, 2)  # spacer
+        self.cmb_disk = QComboBox()
+        self.cmb_disk.addItem("正在检测硬盘...")
+        self.cmb_disk.setEnabled(False)
+        self.cmb_disk.setMinimumWidth(200)
+        grid.addWidget(self.cmb_disk, row, 1, 1, 4)
+        row += 1
+
+        # 磁盘检测进度条（滑块动画）
+        self.pbar_disk = QSlider(Qt.Orientation.Horizontal)
+        self.pbar_disk.setRange(0, 100)
+        self.pbar_disk.setValue(0)
+        self.pbar_disk.setEnabled(False)  # 禁止用户拖动
+        self.pbar_disk.setMaximumHeight(18)
+        self.pbar_disk.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #e8e8e8;
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: transparent;
+            }
+            QSlider::handle:horizontal {
+                background: #3498db;
+                width: 50px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+        """)
+        self.pbar_disk.hide()
+        grid.addWidget(self.pbar_disk, row, 0, 1, 5)
+        row += 1
 
         # 保活写入间隔
         grid.addWidget(QLabel("保活写入间隔:"), row, 3)
@@ -537,12 +561,11 @@ class MainWindow(QMainWindow):
         grid.addLayout(dir_layout, row, 1, 1, 4)
         row += 1
 
-        # 物理磁盘（手动指定）
-        grid.addWidget(QLabel("物理磁盘:"), row, 0)
-        self.edit_physical = QLineEdit()
-        self.edit_physical.setPlaceholderText("留空 = 自动检测（如 PhysicalDrive1）")
-        self.edit_physical.setToolTip("手动指定物理磁盘名称，留空则自动检测")
-        grid.addWidget(self.edit_physical, row, 1, 1, 4)
+        # 允许内置硬盘
+        self.chk_allow_internal = QCheckBox("允许用于内置硬盘（默认仅外接硬盘）")
+        self.chk_allow_internal.setToolTip("勾选后可以对 C: 盘等内置硬盘执行保活操作")
+        self.chk_allow_internal.toggled.connect(self._on_allow_internal_toggled)
+        grid.addWidget(self.chk_allow_internal, row, 0, 1, 5)
         row += 1
 
         return group
@@ -690,26 +713,96 @@ class MainWindow(QMainWindow):
         """用默认配置填充 UI 控件。"""
         self.config = dict(DEFAULT_CONFIG)
 
-        drive = self.config["target_drive"].strip().rstrip(":\\").upper() + ":"
-        idx = self.cmb_drive.findText(drive)
-        if idx >= 0:
-            self.cmb_drive.setCurrentIndex(idx)
-        else:
-            self.cmb_drive.addItem(drive)
-            self.cmb_drive.setCurrentText(drive)
+        # 默认选中第一个外接磁盘，若没有则选第一个磁盘
+        if self.external_disks:
+            self.cmb_disk.setCurrentIndex(0)
+        elif self.all_disks:
+            self.cmb_disk.setCurrentIndex(0)
 
         factor = UNIT_FACTORS[self.current_unit]
         self.spin_keep_alive.setValue(self.config["keep_alive_interval_seconds"] // factor)
         self.spin_check.setValue(self.config["check_interval_seconds"] // factor)
         self.spin_size.setValue(self.config["keep_alive_file_size_kb"])
         self.edit_dir.setText(self.config["keep_alive_dir"] or "")
-        self.edit_physical.setText(self.config["physical_disk"] or "")
+        self.chk_allow_internal.setChecked(self.config["allow_internal_drive"])
+
+    def _start_disk_loading(self):
+        """启动后台线程加载物理磁盘列表。"""
+        self.status_bar.showMessage("正在检测硬盘信息...")
+        self.pbar_disk.setValue(0)
+        self.pbar_disk.show()
+
+        # 单向动画：滑块 0→100，到最右后立即从最左重新开始，无缝循环
+        anim1 = QPropertyAnimation(self.pbar_disk, b"value")
+        anim1.setDuration(1600)
+        anim1.setStartValue(0)
+        anim1.setEndValue(100)
+        anim1.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        anim2 = QPropertyAnimation(self.pbar_disk, b"value")
+        anim2.setDuration(1600)
+        anim2.setStartValue(0)
+        anim2.setEndValue(100)
+        anim2.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        self._disk_anim = QSequentialAnimationGroup()
+        self._disk_anim.addAnimation(anim1)
+        self._disk_anim.addAnimation(anim2)
+        self._disk_anim.setLoopCount(-1)
+        self._disk_anim.start()
+
+        self.disk_load_worker = DiskLoadWorker()
+        self.disk_load_worker.disks_loaded.connect(self._on_disks_loaded)
+        self.disk_load_worker.start()
+
+    def _on_disks_loaded(self, disks: list):
+        """磁盘列表加载完成，填充下拉框。"""
+        if hasattr(self, '_disk_anim'):
+            self._disk_anim.stop()
+        self.pbar_disk.hide()
+
+        self.all_disks = disks
+        self.external_disks = [d for d in disks if d["is_external"]]
+
+        # 填充下拉框
+        self.cmb_disk.clear()
+        self.cmb_disk.setEnabled(True)
+        if self.external_disks:
+            for d in self.external_disks:
+                self.cmb_disk.addItem(d["display_text"], d)
+        elif self.all_disks:
+            for d in self.all_disks:
+                self.cmb_disk.addItem(d["display_text"], d)
+        else:
+            self.cmb_disk.addItem("未检测到硬盘")
+            self.cmb_disk.setEnabled(False)
+
+        # 初始化默认配置
+        self._init_defaults()
+        self.status_bar.showMessage("就绪 - 点击「启动监控」开始", 3000)
+
+    def _on_allow_internal_toggled(self, checked: bool):
+        """切换物理磁盘下拉列表：勾选时显示全部，取消时仅外接。"""
+        if not self.all_disks:
+            return
+        current_data = self.cmb_disk.currentData()
+        self.cmb_disk.clear()
+        disks = self.all_disks if checked else self.external_disks
+        for d in disks:
+            self.cmb_disk.addItem(d["display_text"], d)
+        # 恢复之前选中的磁盘
+        if current_data:
+            for i in range(self.cmb_disk.count()):
+                if self.cmb_disk.itemData(i)["number"] == current_data["number"]:
+                    self.cmb_disk.setCurrentIndex(i)
+                    break
 
     def _on_browse_dir(self):
         """浏览选择保活目录。"""
-        # 默认从目标盘符开始浏览
-        drive = self.cmb_drive.currentText()
-        start_dir = drive + "\\" if os.path.exists(drive + "\\") else "C:\\"
+        disk_data = self.cmb_disk.currentData()
+        start_dir = "C:\\"
+        if disk_data and disk_data["drive_letters"]:
+            start_dir = disk_data["drive_letters"][0] + "\\"
         folder = QFileDialog.getExistingDirectory(self, "选择保活目录", start_dir)
         if folder:
             self.edit_dir.setText(folder)
@@ -755,18 +848,43 @@ class MainWindow(QMainWindow):
 
     def _on_start(self):
         """启动监控。"""
+        disk_data = self.cmb_disk.currentData()
+        if not disk_data:
+            QMessageBox.warning(self, "错误", "未选择目标硬盘")
+            return
+
+        target_drive = disk_data["drive_letters"][0] if disk_data["drive_letters"] else None
+        if not target_drive:
+            QMessageBox.warning(
+                self, "错误",
+                f"物理磁盘 {disk_data['name']} ({disk_data['friendly_name']}) 没有可用的盘符分区"
+            )
+            return
+
+        # 外接硬盘检查
+        if not self.chk_allow_internal.isChecked() and not disk_data["is_external"]:
+            reply = QMessageBox.warning(
+                self, "非外接硬盘",
+                f"磁盘 {disk_data['name']} ({disk_data['friendly_name']}) 检测为内置硬盘。\n\n"
+                "默认仅允许用于外接硬盘以保护系统盘。\n\n"
+                "如需继续，请勾选「允许用于内置硬盘」后重试。",
+                QMessageBox.StandardButton.Ok,
+            )
+            return
+
         factor = UNIT_FACTORS[self.current_unit]
         self.config = {
-            "target_drive": self.cmb_drive.currentText(),
+            "target_drive": target_drive,
             "keep_alive_dir": self.edit_dir.text().strip() or None,
             "keep_alive_interval_seconds": self.spin_keep_alive.value() * factor,
             "check_interval_seconds": self.spin_check.value() * factor,
             "keep_alive_file_size_kb": self.spin_size.value(),
-            "physical_disk": self.edit_physical.text().strip() or None,
+            "physical_disk": disk_data["name"],
             "log_file": None,
             "log_level": "INFO",
             "max_log_file_size_mb": 10,
             "log_backup_count": 3,
+            "allow_internal_drive": self.chk_allow_internal.isChecked(),
         }
 
         # 参数校验
@@ -891,12 +1009,11 @@ class MainWindow(QMainWindow):
         """更新按钮和控件的启用状态。"""
         self.btn_start.setEnabled(not self.is_monitoring)
         self.btn_stop.setEnabled(self.is_monitoring)
-        self.cmb_drive.setEnabled(not self.is_monitoring)
+        self.cmb_disk.setEnabled(not self.is_monitoring)
         self.spin_keep_alive.setEnabled(not self.is_monitoring)
         self.spin_check.setEnabled(not self.is_monitoring)
         self.spin_size.setEnabled(not self.is_monitoring)
         self.edit_dir.setEnabled(not self.is_monitoring)
-        self.edit_physical.setEnabled(not self.is_monitoring)
 
     # ============================================================
     # 日志显示
@@ -971,6 +1088,8 @@ def main():
 
     window = MainWindow()
     window.show()
+    # 窗口显示后再后台加载磁盘列表（避免启动卡顿）
+    QTimer.singleShot(50, window._start_disk_loading)
 
     sys.exit(app.exec())
 

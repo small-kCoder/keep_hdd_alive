@@ -25,6 +25,7 @@
 ================================================================================
 """
 
+import json
 import os
 import sys
 import time
@@ -44,7 +45,7 @@ from typing import Optional, Dict, Any
 DEFAULT_CONFIG: Dict[str, Any] = {
     "target_drive": "D:",                       # 目标硬盘盘符
     "keep_alive_dir": None,                      # 保活文件目录（None = 自动创建）
-    "keep_alive_interval_seconds": 1800,          # 保活文件写入间隔（秒），默认 30 分钟
+    "keep_alive_interval_seconds": 60,           # 保活文件写入间隔（秒），默认 1 分钟
     "check_interval_seconds": 1800,              # 外部活动检查间隔（秒），默认 30 分钟
     "keep_alive_file_size_kb": 4,                # 保活文件大小（KB）
     "log_file": None,                            # 日志文件路径（None = 输出到 stdout）
@@ -52,6 +53,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "physical_disk": None,                       # 手动指定物理磁盘名（如 PhysicalDrive1）
     "max_log_file_size_mb": 10,                  # 日志文件最大大小（MB）
     "log_backup_count": 3,                       # 日志文件备份数量
+    "allow_internal_drive": False,               # 是否允许用于内置硬盘（默认仅外接）
 }
 
 # 保活文件固定名称
@@ -95,17 +97,16 @@ def get_physical_disk_for_drive(drive_letter: str) -> Optional[str]:
         return None
 
     try:
-        cmd = (
-            f'powershell -NoProfile -NonInteractive -Command '
-            f'"Get-Partition -DriveLetter {drive} | Get-Disk | '
-            f'Select-Object -ExpandProperty Number"'
+        ps_cmd = (
+            f'Get-Partition -DriveLetter {drive} | Get-Disk | '
+            f'Select-Object -ExpandProperty Number'
         )
         result = subprocess.run(
-            cmd,
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_cmd],
             capture_output=True,
             text=True,
-            shell=True,
             timeout=15,  # PowerShell 启动可能较慢，设置 15 秒超时
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if result.returncode == 0 and result.stdout.strip():
             disk_num = result.stdout.strip()
@@ -118,6 +119,156 @@ def get_physical_disk_for_drive(drive_letter: str) -> Optional[str]:
         pass  # 其他未知错误，降级处理
 
     return None
+
+
+def is_external_drive(drive_letter: str) -> Optional[bool]:
+    """
+    检测指定盘符是否为 USB 外接硬盘。
+
+    通过 PowerShell 查询物理磁盘的 BusType：
+      - BusType = "USB" → 外接硬盘 → True
+      - BusType = "SATA" / "NVMe" / "RAID" 等 → 内置硬盘 → False
+
+    Args:
+        drive_letter: 盘符，如 "D:" 或 "D"
+
+    Returns:
+        True = 外接硬盘, False = 内置硬盘, None = 检测失败
+    """
+    drive = drive_letter.strip().rstrip(":\\").upper()
+    if len(drive) != 1:
+        return None
+
+    try:
+        ps_cmd = (
+            f'Get-Partition -DriveLetter {drive} | Get-Disk | '
+            f'Select-Object -ExpandProperty BusType'
+        )
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            bus_type = result.stdout.strip().upper()
+            return bus_type == "USB"
+    except subprocess.TimeoutExpired:
+        pass
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    return None
+
+
+def get_all_physical_disks() -> list:
+    """
+    获取所有物理磁盘及其盘符信息。
+
+    分两步查询避免 PowerShell $变量被工具 shell 吃掉：
+    1. 获取所有物理磁盘的 Number, BusType, FriendlyName, Size
+    2. 在 Python 中循环，为每个磁盘单独查询盘符（每条命令不含 $变量）
+
+    Returns:
+        [
+            {
+                "number": 0,
+                "name": "PhysicalDrive0",
+                "bus_type": "NVMe",
+                "friendly_name": "THNSN5256GPUK NVMe TOSHIBA 256GB",
+                "size_gb": 238,
+                "drive_letters": ["C:"],
+                "is_external": False,
+                "display_text": "PhysicalDrive0 - NVMe THNSN5256GPUK [C:]"
+            },
+            ...
+        ]
+        失败时返回空列表 []
+    """
+    try:
+        # ---- 步骤1：获取所有物理磁盘基本信息 ----
+        ps_cmd = (
+            'Get-Disk | '
+            'Select-Object Number, BusType, FriendlyName, Size | '
+            'ConvertTo-Json'
+        )
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=15,  # PowerShell 启动可能较慢，设置 15 秒超时
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        raw_disks = json.loads(result.stdout.strip())
+        if isinstance(raw_disks, dict):
+            raw_disks = [raw_disks]
+
+        # ---- 步骤2：为每个磁盘查询盘符 ----
+        disks = []
+        for raw in raw_disks:
+            number = raw.get("Number")
+            if number is None:
+                continue
+
+            # 查询该磁盘的盘符列表（不涉及 $变量）
+            drive_letters = []
+            try:
+                ps_cmd2 = (
+                    f'Get-Partition -DiskNumber {number} | '
+                    f'Where-Object DriveLetter | '
+                    f'Select-Object -ExpandProperty DriveLetter'
+                )
+                result2 = subprocess.run(
+                    ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_cmd2],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if result2.returncode == 0 and result2.stdout.strip():
+                    drive_letters = [
+                        f"{letter.strip()}:" for letter in result2.stdout.strip().split('\n') if letter.strip()
+                    ]
+            except Exception:
+                pass  # 查询盘符失败，drive_letters 保持为空
+
+            bus_type = raw.get("BusType", "Unknown")
+            friendly_name = raw.get("FriendlyName", "Unknown Disk")
+            size_bytes = raw.get("Size", 0)
+            size_gb = round(size_bytes / (1024 ** 3), 1) if size_bytes else 0
+
+            is_external = (bus_type.upper() == "USB")
+
+            # 构建显示文本
+            drive_str = f"[{', '.join(drive_letters)}]" if drive_letters else "[无盘符]"
+            display_text = (
+                f"PhysicalDrive{number} - {bus_type} {friendly_name} {drive_str}"
+            )
+
+            disks.append({
+                "number": number,
+                "name": f"PhysicalDrive{number}",
+                "bus_type": bus_type,
+                "friendly_name": friendly_name,
+                "size_gb": size_gb,
+                "drive_letters": drive_letters,
+                "is_external": is_external,
+                "display_text": display_text,
+            })
+
+        return disks
+
+    except json.JSONDecodeError:
+        return []
+    except subprocess.TimeoutExpired:
+        return []
+    except Exception:
+        return []
 
 
 def validate_drive_access(drive: str, keep_alive_dir: str) -> None:
