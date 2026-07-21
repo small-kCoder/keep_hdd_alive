@@ -690,13 +690,34 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _force_cleanup(self):
+        """强制清理所有后台线程和子进程。"""
+        # 1. 停止 worker 线程
+        if self.worker:
+            self.worker.stop()
+            if not self.worker.wait(2000):
+                self.worker.terminate()
+                self.worker.wait(1000)
+
+        # 2. 停止日志发射器线程
+        if self.log_emitter:
+            self.log_emitter.quit()
+            if not self.log_emitter.wait(2000):
+                self.log_emitter.terminate()
+                self.log_emitter.wait(1000)
+
+        # 3. 停止磁盘加载线程
+        if self.disk_load_worker and self.disk_load_worker.isRunning():
+            self.disk_load_worker.terminate()
+            self.disk_load_worker.wait(1000)
+
     def _tray_quit(self):
         """从托盘菜单完全退出程序。"""
-        if self.is_monitoring and self.worker:
-            self.worker.stop()
-            self.worker.wait(3000)
+        self._force_cleanup()
         self.tray_icon.hide()
         QApplication.quit()
+        # 确保进程彻底退出
+        QTimer.singleShot(500, lambda: os._exit(0))
 
     def _update_tray_tooltip(self):
         """更新托盘图标的工具提示。"""
@@ -1064,11 +1085,10 @@ class MainWindow(QMainWindow):
             event.ignore()
         elif clicked == btn_quit:
             # 完全退出
-            if self.worker:
-                self.worker.stop()
-                self.worker.wait(3000)
+            self._force_cleanup()
             self.tray_icon.hide()
             event.accept()
+            QTimer.singleShot(500, lambda: os._exit(0))
         else:
             # 取消
             event.ignore()
