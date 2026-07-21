@@ -1056,42 +1056,15 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def closeEvent(self, event):
-        """窗口关闭事件：弹出选项对话框。"""
-        if not self.is_monitoring:
-            # 未在监控中，直接退出
-            self.tray_icon.hide()
-            event.accept()
-            return
-
-        # 弹出三选项对话框
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("关闭选项")
-        msg_box.setText("请选择关闭方式：")
-        msg_box.setIcon(QMessageBox.Icon.Question)
-
-        btn_tray = msg_box.addButton("最小化到系统托盘", QMessageBox.ButtonRole.AcceptRole)
-        btn_quit = msg_box.addButton("完全退出", QMessageBox.ButtonRole.DestructiveRole)
-        btn_cancel = msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
-
-        msg_box.setDefaultButton(btn_tray)
-        msg_box.exec()
-
-        clicked = msg_box.clickedButton()
-
-        if clicked == btn_tray:
-            # 最小化到托盘
+        """窗口关闭：正在监控时最小化到托盘，未监控时直接退出。"""
+        if self.is_monitoring:
             self.hide()
-            self._append_log("INFO", "程序已最小化到系统托盘，监控继续运行中")
             event.ignore()
-        elif clicked == btn_quit:
-            # 完全退出
+        else:
             self._force_cleanup()
             self.tray_icon.hide()
             event.accept()
             QTimer.singleShot(500, lambda: os._exit(0))
-        else:
-            # 取消
-            event.ignore()
 
 
 # ============================================================
